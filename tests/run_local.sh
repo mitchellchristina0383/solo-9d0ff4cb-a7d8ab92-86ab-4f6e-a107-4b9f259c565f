@@ -20,9 +20,15 @@ start_receiver() {
     >>"$LOG_DIR/receiver.log" 2>&1 &
 }
 start_sender() {
+  # 默认关闭启动自动核对，避免后台线程与慢回执等用例产生时序竞争；
+  # 需要验证「重启自动核对」的场景通过 restart-sender-autoreconcile 钩子单独开启。
   DB_PATH="$DATA_DIR/sender.db" RECEIVER_URL="http://127.0.0.1:8001" \
+  STARTUP_RECONCILE="${STARTUP_RECONCILE:-0}" \
     nohup "$PY" -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --app-dir "$ROOT/sender" \
     >>"$LOG_DIR/sender.log" 2>&1 &
+}
+start_sender_autoreconcile() {
+  STARTUP_RECONCILE=1 start_sender
 }
 stop_receiver() { pkill -f "uvicorn app.main:app --host 127.0.0.1 --port 8001" 2>/dev/null || true; }
 stop_sender()   { pkill -f "uvicorn app.main:app --host 127.0.0.1 --port 8000" 2>/dev/null || true; }
@@ -33,6 +39,7 @@ case "${1:-}" in
   stop-receiver) stop_receiver ;;
   start-receiver) start_receiver ;;
   restart-sender) stop_sender; sleep 1; start_sender ;;
+  restart-sender-autoreconcile) stop_sender; sleep 1; start_sender_autoreconcile ;;
   clean) stop_receiver; stop_sender; rm -rf "$DATA_DIR" ;;
   test)
     "$0" stop-all || true
@@ -42,7 +49,8 @@ case "${1:-}" in
     RN_HOOK_STOP_RECEIVER="$ROOT/tests/run_local.sh stop-receiver" \
     RN_HOOK_START_RECEIVER="$ROOT/tests/run_local.sh start-receiver" \
     RN_HOOK_RESTART_SENDER="$ROOT/tests/run_local.sh restart-sender" \
+    RN_HOOK_RESTART_SENDER_AUTO="$ROOT/tests/run_local.sh restart-sender-autoreconcile" \
     python3 "$ROOT/tests/selftest.py" --lifecycle
     ;;
-  *) echo "用法: $0 {start-all|stop-all|stop-receiver|start-receiver|restart-sender|clean|test}"; exit 1 ;;
+  *) echo "用法: $0 {start-all|stop-all|stop-receiver|start-receiver|restart-sender|restart-sender-autoreconcile|clean|test}"; exit 1 ;;
 esac

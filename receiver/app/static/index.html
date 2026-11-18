@@ -3,40 +3,113 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>审计接收端 · 回执台账</title>
+<title>审计接收端 · 回执台账与人工复核</title>
 <style>
   body { font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; margin: 0; background: #f4f6f8; color: #1f2933; }
   header { background: #3e4c59; color: #fff; padding: 14px 24px; }
   header h1 { font-size: 18px; margin: 0; }
   header p { margin: 4px 0 0; font-size: 12px; color: #cbd2d9; }
-  main { max-width: 980px; margin: 20px auto; padding: 0 16px; }
+  main { max-width: 1180px; margin: 20px auto; padding: 0 16px; }
   .card { background: #fff; border: 1px solid #e4e7eb; border-radius: 8px; padding: 16px 20px; margin-bottom: 16px; }
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid #eef1f4; }
-  th { color: #7b8794; font-weight: 600; }
+  th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid #eef1f4; vertical-align: top; }
+  th { color: #7b8794; font-weight: 600; white-space: nowrap; }
   code { background: #eef1f4; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
   .muted { color: #9aa5b1; font-size: 12px; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 12px; white-space: nowrap; }
+  .b-none { background: #e4e7eb; color: #52606d; }
+  .b-approved { background: #d9f2e3; color: #1c7c43; }
+  .b-rejected { background: #fdecea; color: #c0392b; }
+  .b-needs_followup { background: #fff3cd; color: #8a6d1a; }
+  .rv input[type=text], .rv textarea, .rv select { width: 100%; padding: 5px 7px; border: 1px solid #cbd2d9; border-radius: 6px; font-size: 13px; }
+  .rv textarea { resize: vertical; min-height: 30px; }
+  .rv button { background: #0967d2; color: #fff; border: 0; border-radius: 6px; padding: 6px 14px; font-size: 13px; cursor: pointer; }
+  .rv button:hover { filter: brightness(1.08); }
+  .rv .done { font-size: 12px; color: #52606d; }
+  #toast { position: fixed; right: 20px; bottom: 20px; max-width: 420px; font-size: 13px; padding: 10px 14px; border-radius: 8px; display: none; }
+  #toast.ok { display: block; background: #e3f2e9; color: #1c7c43; border: 1px solid #b6e2c6; }
+  #toast.err { display: block; background: #fdecea; color: #c0392b; border: 1px solid #f5c6c0; }
 </style>
 </head>
 <body>
 <header>
-  <h1>审计接收端 · 回执台账</h1>
-  <p>相同「环境+发布号」的同内容重试只记一次；内容不同返回 409 冲突。本页每 3 秒自动刷新。</p>
+  <h1>审计接收端 · 回执台账与人工复核</h1>
+  <p>相同「环境+发布号」的同内容重试只记一次；内容不同返回 409 冲突。复核仅能对已入账回执提交：
+     同回执同内容重试只保留一条，不同内容报 409。本页每 3 秒自动刷新。</p>
 </header>
 <main>
   <section class="card">
     <p class="muted">
-      接口：<code>POST /api/receipts</code>（body 可带 <code>"simulate":"lose_response"</code> 模拟入库后丢响应，
-      或 <code>"slow"</code> 模拟慢回执）· <code>GET /api/receipts?env=...&amp;release_no=...</code> 查询回执
+      通知入账：<code>POST /api/receipts</code>（body 可带 <code>"simulate":"lose_response"</code> 或 <code>"slow"</code>）·
+      回执查询：<code>GET /api/receipts?env=...&amp;release_no=...</code> ·
+      人工复核：<code>POST /api/receipts/review</code>
     </p>
     <table>
-      <thead><tr><th>ID</th><th>环境</th><th>发布号</th><th>结果</th><th>入账时间 (UTC)</th></tr></thead>
+      <thead>
+        <tr>
+          <th>ID</th><th>环境</th><th>发布号</th><th>结果</th><th>入账时间 (UTC)</th>
+          <th style="min-width:300px">人工复核</th>
+        </tr>
+      </thead>
       <tbody id="rows"></tbody>
     </table>
   </section>
 </main>
+<div id="toast"></div>
 <script>
-function esc(s) { return String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
+const CONC_LABEL = { approved: "复核通过", rejected: "复核驳回", needs_followup: "需跟进" };
+
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+
+function toast(text, ok) {
+  const el = document.getElementById("toast");
+  el.textContent = text;
+  el.className = ok ? "ok" : "err";
+  clearTimeout(toast._t);
+  toast._t = setTimeout(() => { el.style.display = "none"; el.className = ""; }, 5000);
+}
+
+async function submitReview(n) {
+  const reviewer = document.getElementById("rv-" + n.id + "-reviewer").value;
+  const conclusion = document.getElementById("rv-" + n.id + "-conclusion").value;
+  const remark = document.getElementById("rv-" + n.id + "-remark").value;
+  const r = await fetch("/api/receipts/review", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ env: n.env, release_no: n.release_no, reviewer, conclusion, remark }),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (r.status === 200 && data.deduplicated) toast("同内容重试：复核已存在，仅保留一条（#" + data.id + "）", true);
+  else if (r.status === 201) toast("复核已提交（#" + data.id + "）", true);
+  else if (r.status === 404) toast("404：回执不存在，不能复核", false);
+  else if (r.status === 409) toast("409 冲突：" + (data.detail || "已存在不同内容的复核"), false);
+  else toast("提交失败：" + (data.detail || r.status), false);
+  load();
+}
+
+function reviewCell(n) {
+  const rv = n.review;
+  if (rv) {
+    return '<div class="done">' +
+      '<span class="badge b-' + esc(rv.conclusion) + '">' + (CONC_LABEL[rv.conclusion] || esc(rv.conclusion)) + "</span><br>" +
+      "复核人：" + esc(rv.reviewer) + "<br>" +
+      "备注：" + esc(rv.remark || "—") + "<br>" +
+      '<span class="muted">#' + rv.id + " · " + esc(rv.reviewed_at) + "</span></div>";
+  }
+  return '<div class="rv" style="display:flex;flex-direction:column;gap:5px">' +
+    '<input type="text" id="rv-' + n.id + '-reviewer" placeholder="复核人" maxlength="64">' +
+    '<div style="display:flex;gap:5px">' +
+    '<select id="rv-' + n.id + '-conclusion">' +
+    '<option value="approved">复核通过</option>' +
+    '<option value="rejected">复核驳回</option>' +
+    '<option value="needs_followup">需跟进</option>' +
+    "</select></div>" +
+    '<textarea id="rv-' + n.id + '-remark" placeholder="备注（可选）" maxlength="256"></textarea>' +
+    '<button type="button">提交复核</button></div>';
+}
+
 async function load() {
   const r = await fetch("/api/receipts");
   const data = await r.json();
@@ -44,8 +117,12 @@ async function load() {
   tbody.innerHTML = "";
   for (const n of (data.items || [])) {
     const tr = document.createElement("tr");
-    tr.innerHTML = "<td>" + n.id + "</td><td>" + esc(n.env) + "</td><td>" + esc(n.release_no) +
-      "</td><td>" + esc(n.result) + "</td><td class='muted'>" + esc(n.received_at) + "</td>";
+    tr.innerHTML =
+      "<td>" + n.id + "</td><td>" + esc(n.env) + "</td><td>" + esc(n.release_no) +
+      "</td><td>" + esc(n.result) + "</td><td class='muted'>" + esc(n.received_at) + "</td>" +
+      "<td>" + reviewCell(n) + "</td>";
+    const btn = tr.querySelector(".rv button");
+    if (btn) btn.onclick = () => submitReview(n);
     tbody.appendChild(tr);
   }
 }

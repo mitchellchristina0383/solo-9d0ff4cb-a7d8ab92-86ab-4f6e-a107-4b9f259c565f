@@ -13,6 +13,16 @@
   S9  接收端不可用 → 待核且不虚报成功（--lifecycle）
   S10 发送端重启（接收端停机中）→ 待核持久 → 恢复后凭回执补核（--lifecycle）
   S11 发送端重启（接收端正常）→ 启动自动核对凭回执结案（--lifecycle）
+  R1  不存在的回执不能复核（404，且无复核记录）
+  R2  复核正常提交：发送端核对后同时显示送达与复核状态
+  R3  同回执同内容重试：幂等 200，复核只保留一条
+  R4  同回执不同内容：409 冲突，原复核不被篡改
+  R5  复核后再发送/再核对交错：复核状态不倒退、不孤立
+  R6  发送端本地写入失败（write_fail）：500 且原状态不变，恢复后可继续
+  R7  接收端复核写入失败（review_write_fail）：无复核落库，重试成功
+  R8  并发复核提交（同内容/不同内容）：仅一条，败者 409
+  R9  并发交错：发送与核对竞争同一记录，无孤立/倒退终态
+  R10 复核状态随发送端重启持久（--lifecycle）
 
 用法：
   python3 tests/selftest.py [--lifecycle]
@@ -88,6 +98,29 @@ def sender_rows(rel):
 def receiver_rows(rel):
     _, d = req("GET", RECEIVER + "/api/receipts")
     return [x for x in d.get("items", []) if x["env"] == ENV and x["release_no"] == rel]
+
+
+def review_rows(rel):
+    """直接查接收端台账内嵌的复核对象。"""
+    rows = receiver_rows(rel)
+    return [r["review"] for r in rows if r.get("review")]
+
+
+def submit_review(rel, reviewer="auditor", conclusion="approved", remark="ok",
+                  write_fail=False):
+    body = {"env": ENV, "release_no": rel, "reviewer": reviewer,
+            "conclusion": conclusion, "remark": remark}
+    if write_fail:
+        body["review_write_fail"] = True
+    return req("POST", RECEIVER + "/api/receipts/review", body)
+
+
+def sender_get(nid):
+    _, d = req("GET", SENDER + "/api/notifications")
+    for x in d.get("items", []):
+        if x["id"] == nid:
+            return x
+    return None
 
 
 def hook(env_var, default_cmd):
@@ -173,7 +206,9 @@ def s6_slow_response():
     code, n = sender_create(ENV, k, "success")
     nid = n["id"]
     code, n2 = sender_send(nid, simulate="slow")
-    check("S6 慢回执超时后为待核", n2.get("status") == "UNCERTAIN", f"{n2}")
+    # 必须以发送响应为准断言：慢回执会在 6s 后落库，随后的核对即可确认，
+    # 不能在核对之后再回读状态（那时已被核对推进为已确认）。
+    check("S6 慢回执超时后发送响应为待核", n2.get("status") == "UNCERTAIN", f"{n2}")
     code, n3 = sender_reconcile(nid)
     check("S6 核对后确认", n3.get("status") == "ACKED", f"{n3}")
     check("S6 接收端仅一条", len(receiver_rows(k)) == 1)
@@ -280,7 +315,9 @@ def s11_auto_reconcile_after_restart():
     nid = n["id"]
     sender_send(nid, simulate="lose_response")
     check("S11 重启前为待核", sender_rows(k)[0]["status"] == "UNCERTAIN")
-    hook("RN_HOOK_RESTART_SENDER", "docker compose restart sender")
+    # 仅本场景需要启动自动核对：本地钩子以 STARTUP_RECONCILE=1 重启；
+    # Docker 模式下发送端默认即开启启动核对，普通 restart 即可。
+    hook("RN_HOOK_RESTART_SENDER_AUTO", "docker compose restart sender")
     if not wait_up(SENDER):
         check("S11 发送端重启后恢复服务", False)
         return
@@ -293,6 +330,216 @@ def s11_auto_reconcile_after_restart():
         time.sleep(0.5)
     check("S11 重启后自动凭接收端回执结案", final is not None, f"{sender_rows(k)}")
     check("S11 接收端仍仅一条", len(receiver_rows(k)) == 1)
+
+
+# ---------------- 人工复核场景 ----------------
+
+def r1_review_unknown_receipt():
+    k = key("r1")
+    code, d = submit_review(k)
+    check("R1 不存在的回执不能复核（404）", code == 404, f"code={code} {d}")
+    check("R1 失败尝试未留下任何复核", review_rows(k) == [], f"{review_rows(k)}")
+
+
+def r2_review_happy_path():
+    k = key("r2")
+    code, n = sender_create(ENV, k, "success")
+    nid = n["id"]
+    code, n2 = sender_send(nid)
+    check("R2 送达后初始未复核", n2.get("status") == "ACKED" and n2.get("review_status") == "NONE", f"{n2}")
+    code, rv = submit_review(k, reviewer="alice", conclusion="approved", remark="looks good")
+    check("R2 复核提交成功（201）", code == 201 and bool(rv.get("id")), f"code={code} {rv}")
+    code, n3 = sender_reconcile(nid)
+    check("R2 核对后同时显示已确认与已复核",
+          n3.get("status") == "ACKED" and n3.get("review_status") == "REVIEWED", f"{n3}")
+    check("R2 复核明细已同步（复核人/结论/备注）",
+          n3.get("reviewer") == "alice" and n3.get("review_conclusion") == "approved"
+          and n3.get("review_remark") == "looks good" and bool(n3.get("review_id")), f"{n3}")
+
+
+def r3_review_idempotent_retry():
+    k = key("r3")
+    code, n = sender_create(ENV, k, "success")
+    nid = n["id"]
+    sender_send(nid)
+    payload = {"env": ENV, "release_no": k, "reviewer": "bob",
+               "conclusion": "needs_followup", "remark": "retry me"}
+    c1, d1 = req("POST", RECEIVER + "/api/receipts/review", payload)
+    c2, d2 = req("POST", RECEIVER + "/api/receipts/review", payload)
+    c3, d3 = req("POST", RECEIVER + "/api/receipts/review", payload)
+    check("R3 同内容复核重试：首次 201，后续 200 幂等",
+          c1 == 201 and c2 == 200 and d2.get("deduplicated") is True
+          and c3 == 200 and d3.get("deduplicated") is True, f"{c1} {c2} {c3}")
+    check("R3 同回执复核只保留一条", len(review_rows(k)) == 1 and review_rows(k)[0]["id"] == d1["id"],
+          f"{review_rows(k)}")
+    code, n3 = sender_reconcile(nid)
+    check("R3 发送端复核状态仍只有一份", n3.get("review_id") == d1["id"], f"{n3}")
+
+
+def r4_review_conflict():
+    k = key("r4")
+    code, n = sender_create(ENV, k, "success")
+    nid = n["id"]
+    sender_send(nid)
+    c1, _ = submit_review(k, reviewer="alice", conclusion="approved", remark="v1")
+    c2, d2 = submit_review(k, reviewer="bob", conclusion="rejected", remark="v2")
+    check("R4 同回执不同内容复核报 409", c1 == 201 and c2 == 409, f"{c1} {c2} {d2}")
+    rows = review_rows(k)
+    check("R4 原复核未被篡改且仍只一条",
+          len(rows) == 1 and rows[0]["reviewer"] == "alice"
+          and rows[0]["conclusion"] == "approved", f"{rows}")
+    code, n3 = sender_reconcile(nid)
+    check("R4 发送端同步到的是原始复核", n3.get("reviewer") == "alice"
+          and n3.get("review_conclusion") == "approved", f"{n3}")
+
+
+def r5_review_interleave_no_regression():
+    k = key("r5")
+    code, n = sender_create(ENV, k, "success")
+    nid = n["id"]
+    # 先制造待核，再由审计员复核，交错执行发送与核对
+    sender_send(nid, simulate="lose_response")
+    submit_review(k, reviewer="mia", conclusion="approved", remark="interleave")
+    c1, n1 = sender_send(nid)  # 重发拿到带复核的回执
+    check("R5 交错重发后已确认且已复核",
+          n1.get("status") == "ACKED" and n1.get("review_status") == "REVIEWED", f"{n1}")
+    c2, n2 = sender_reconcile(nid)  # 再次核对
+    check("R5 再次核对不降级、不丢复核",
+          n2.get("status") == "ACKED" and n2.get("review_status") == "REVIEWED"
+          and n2.get("reviewer") == "mia", f"{n2}")
+    c3, n3 = req("POST", f"{SENDER}/api/notifications/{nid}/send")  # 已确认重发
+    check("R5 已确认重发为幂等返回且复核保持",
+          c3 == 200 and n3.get("status") == "ACKED" and n3.get("review_status") == "REVIEWED", f"{n3}")
+    check("R5 接收端回执与复核各仅一条",
+          len(receiver_rows(k)) == 1 and len(review_rows(k)) == 1)
+
+
+def r6_sender_write_fail_keeps_state():
+    k = key("r6")
+    code, n = sender_create(ENV, k, "success")
+    nid = n["id"]
+    # 6a 发送阶段本地写入失败：回执其实已到接收端，本地保持待核
+    c1, d1 = req("POST", f"{SENDER}/api/notifications/{nid}/send?simulate=write_fail")
+    n1 = sender_get(nid)
+    check("R6a 发送写入失败返回 500", c1 == 500, f"code={c1} {d1}")
+    check("R6a 本地保持待核、未虚报成功",
+          n1.get("status") == "UNCERTAIN" and n1.get("review_status") == "NONE", f"{n1}")
+    check("R6a 接收端已入账一条", len(receiver_rows(k)) == 1)
+    # 6b 核对阶段本地写入失败：原状态同样不变
+    c2, d2 = req("POST", f"{SENDER}/api/notifications/{nid}/reconcile?write_fail=true")
+    n2 = sender_get(nid)
+    check("R6b 核对写入失败返回 500 且状态不变",
+          c2 == 500 and n2.get("status") == "UNCERTAIN", f"code={c2} {d2} {n2}")
+    # 6c 恢复后正常核对结案
+    c3, n3 = sender_reconcile(nid)
+    check("R6 恢复后凭回执核对为已确认", c3 == 200 and n3.get("status") == "ACKED", f"{n3}")
+    check("R6 全程接收端仅一条", len(receiver_rows(k)) == 1)
+
+
+def r7_receiver_review_write_fail():
+    k = key("r7")
+    code, n = sender_create(ENV, k, "success")
+    nid = n["id"]
+    sender_send(nid)
+    c1, d1 = submit_review(k, reviewer="dan", conclusion="approved", write_fail=True)
+    check("R7 复核写入失败返回 500", c1 == 500, f"code={c1} {d1}")
+    check("R7 失败后无复核落库", review_rows(k) == [], f"{review_rows(k)}")
+    c2, rv = submit_review(k, reviewer="dan", conclusion="approved")
+    check("R7 重试提交成功", c2 == 201 and bool(rv.get("id")), f"code={c2} {rv}")
+    check("R7 最终复核仅一条", len(review_rows(k)) == 1)
+    code, n3 = sender_reconcile(nid)
+    check("R7 发送端随后可同步复核", n3.get("review_status") == "REVIEWED", f"{n3}")
+
+
+def r8_concurrent_reviews():
+    k = key("r8")
+    code, n = sender_create(ENV, k, "success")
+    sender_send(n["id"])
+    results = []
+
+    def worker(i):
+        if i % 2 == 0:
+            c, d = submit_review(k, reviewer="team", conclusion="approved", remark="same")
+        else:
+            c, d = submit_review(k, reviewer=f"user{i}", conclusion="rejected", remark=f"d{i}")
+        results.append((i, c, d.get("deduplicated", False)))
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(10)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    rows = review_rows(k)
+    check("R8 并发复核后接收端仅一条", len(rows) == 1, f"{rows}")
+    created = [r for r in results if r[1] == 201]
+    conflicts = [r for r in results if r[1] == 409]
+    check("R8 仅一个线程写入成功，其余为 409（或幂等 200）",
+          len(created) == 1 and len(conflicts) + sum(1 for r in results if r[1] == 200) == 9,
+          f"{results}")
+
+
+def r9_concurrent_send_reconcile():
+    k = key("r9")
+    code, n = sender_create(ENV, k, "success")
+    nid = n["id"]
+    outcomes = []
+
+    def send_worker():
+        try:
+            c, d = req("POST", f"{SENDER}/api/notifications/{nid}/send?simulate=lose_response")
+            outcomes.append(("send", c, d.get("status"), d.get("review_status")))
+        except Exception as e:  # noqa: BLE001
+            outcomes.append(("send", "EXC", str(e), None))
+
+    def reconcile_worker():
+        try:
+            c, d = req("POST", f"{SENDER}/api/notifications/{nid}/reconcile")
+            outcomes.append(("rec", c, d.get("status"), d.get("review_status")))
+        except Exception as e:  # noqa: BLE001
+            outcomes.append(("rec", "EXC", str(e), None))
+
+    # 交错：发送（丢回执）与核对同时进行
+    t1 = threading.Thread(target=send_worker)
+    t2 = threading.Thread(target=reconcile_worker)
+    t1.start(); t2.start(); t1.join(); t2.join()
+    check("R9 交错操作无异常", all(o[1] != "EXC" for o in outcomes), f"{outcomes}")
+    mid = sender_get(nid)
+    check("R9 交错后无孤立状态（待核/已确认之一）",
+          mid.get("status") in ("UNCERTAIN", "ACKED"), f"{mid}")
+    # 审计员复核后再次并发核对，验证复核不丢失、不倒退
+    submit_review(k, reviewer="neo", conclusion="approved", remark="final")
+    threads = [threading.Thread(target=reconcile_worker) for _ in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    final = sender_get(nid)
+    check("R9 并发核对后终态为已确认+已复核且不倒退",
+          final.get("status") == "ACKED" and final.get("review_status") == "REVIEWED"
+          and final.get("reviewer") == "neo", f"{final}")
+    check("R9 接收端回执与复核各仅一条",
+          len(receiver_rows(k)) == 1 and len(review_rows(k)) == 1)
+
+
+def r10_review_persists_restart():
+    k = key("r10")
+    code, n = sender_create(ENV, k, "success")
+    nid = n["id"]
+    sender_send(nid)
+    submit_review(k, reviewer="eva", conclusion="approved", remark="persist")
+    code, n2 = sender_reconcile(nid)
+    check("R10 重启前已确认且已复核",
+          n2.get("status") == "ACKED" and n2.get("review_status") == "REVIEWED", f"{n2}")
+    hook("RN_HOOK_RESTART_SENDER", "docker compose restart sender")
+    if not wait_up(SENDER):
+        check("R10 发送端重启后恢复服务", False)
+        return
+    time.sleep(4)  # 等启动核对线程跑完
+    final = sender_get(nid)
+    check("R10 重启后送达与复核状态均可继续查询",
+          final is not None and final.get("status") == "ACKED"
+          and final.get("review_status") == "REVIEWED"
+          and final.get("reviewer") == "eva", f"{final}")
 
 
 def main():
@@ -310,10 +557,20 @@ def main():
     s6_slow_response()
     s7_concurrent_same()
     s8_concurrent_diff()
+    r1_review_unknown_receipt()
+    r2_review_happy_path()
+    r3_review_idempotent_retry()
+    r4_review_conflict()
+    r5_review_interleave_no_regression()
+    r6_sender_write_fail_keeps_state()
+    r7_receiver_review_write_fail()
+    r8_concurrent_reviews()
+    r9_concurrent_send_reconcile()
     if lifecycle:
         nid_k9 = s9_receiver_down()
         s10_sender_restart_while_down(nid_k9)
         s11_auto_reconcile_after_restart()
+        r10_review_persists_restart()
 
     print(f"\n通过 {len(PASSED)} 项，失败 {len(FAILED)} 项")
     if FAILED:

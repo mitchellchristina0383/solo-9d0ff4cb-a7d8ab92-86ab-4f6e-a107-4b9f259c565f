@@ -11,7 +11,7 @@
   header h1 { font-size: 18px; margin: 0; }
   header p { margin: 4px 0 0; font-size: 12px; color: #9aa5b1; }
   header a { color: #7fd1ff; }
-  main { max-width: 1100px; margin: 20px auto; padding: 0 16px; }
+  main { max-width: 1280px; margin: 20px auto; padding: 0 16px; }
   .card { background: #fff; border: 1px solid #e4e7eb; border-radius: 8px; padding: 16px 20px; margin-bottom: 16px; }
   .card h2 { font-size: 15px; margin: 0 0 12px; }
   label { font-size: 13px; color: #52606d; display: block; margin-bottom: 10px; }
@@ -33,16 +33,20 @@
   .b-UNCERTAIN { background: #fff3cd; color: #8a6d1a; }
   .b-ACKED { background: #d9f2e3; color: #1c7c43; }
   .b-CONFLICT { background: #fdecea; color: #c0392b; }
+  .b-NONE { background: #e4e7eb; color: #7b8794; }
+  .b-REVIEWED { background: #e1efff; color: #0b5cad; }
   .muted { color: #9aa5b1; font-size: 12px; }
   .toolbar { display: flex; gap: 8px; align-items: center; margin-bottom: 10px; }
-  .err-text { color: #c0392b; font-size: 12px; max-width: 220px; word-break: break-all; }
+  .err-text { color: #c0392b; font-size: 12px; max-width: 200px; word-break: break-all; }
+  .rv-detail { font-size: 12px; color: #52606d; margin-top: 4px; line-height: 1.5; }
 </style>
 </head>
 <body>
 <header>
   <h1>发布值班台 · 部署完成通知（发送端）</h1>
-  <p>仅凭接收端回执确认送达；丢回执 / 接收端不可达 / 本端重启后保持「待核」，可核对补账，绝不虚报成功。
-     接收端台账：<a href="http://localhost:8001" target="_blank">http://localhost:8001</a></p>
+  <p>仅凭接收端回执确认送达与人工复核；丢回执 / 接收端不可达 / 本端重启后保持「待核」，可核对补账，绝不虚报成功。
+     复核状态随回执单向推进，不会被发送/核对交错操作清空或倒退。
+     接收端台账与复核入口：<a href="http://localhost:8001" target="_blank">http://localhost:8001</a></p>
 </header>
 <main>
   <section class="card">
@@ -69,13 +73,17 @@
 
   <section class="card">
     <div class="toolbar">
-      <h2 style="margin:0;flex:1">通知记录</h2>
+      <h2 style="margin:0;flex:1">通知记录（送达状态与复核状态同时展示）</h2>
       <button class="ghost small" id="btn-refresh">刷新</button>
       <button class="ghost small" id="btn-reconcile-all">核对全部待核</button>
     </div>
     <table>
       <thead>
-        <tr><th>ID</th><th>环境</th><th>发布号</th><th>结果</th><th>状态</th><th>尝试</th><th>回执</th><th>最近错误</th><th>更新时间 (UTC)</th><th>操作</th></tr>
+        <tr>
+          <th>ID</th><th>环境</th><th>发布号</th><th>结果</th>
+          <th>送达状态</th><th>复核状态</th><th>尝试</th><th>回执</th>
+          <th>最近错误</th><th>更新时间 (UTC)</th><th>操作</th>
+        </tr>
       </thead>
       <tbody id="rows"></tbody>
     </table>
@@ -83,6 +91,8 @@
 </main>
 <script>
 const STATUS_LABEL = { PENDING: "待发送", UNCERTAIN: "待核", ACKED: "已确认", CONFLICT: "冲突" };
+const REVIEW_LABEL = { NONE: "未复核", REVIEWED: "已复核" };
+const CONC_LABEL = { approved: "复核通过", rejected: "复核驳回", needs_followup: "需跟进" };
 
 async function api(path, opts) {
   const r = await fetch(path, opts);
@@ -97,12 +107,27 @@ function showMsg(text, ok) {
   el.className = ok ? "ok" : "err";
 }
 
-function report(d) {
-  if (!d || !d.status) { showMsg("操作失败", false); return; }
+function report(d, httpStatus) {
+  if (!d) { showMsg("操作失败", false); return; }
+  if (httpStatus === 500) { showMsg("写入失败，状态保持不变：" + (d.detail || ""), false); return; }
+  if (httpStatus === 409) { showMsg("冲突：" + (d.detail || d.last_error || "内容不一致"), false); return; }
+  if (!d.status) { showMsg("操作失败", false); return; }
   if (d.status === "ACKED") showMsg("已确认送达（回执 #" + (d.receipt_id ?? "?") + "）", true);
   else if (d.status === "CONFLICT") showMsg("冲突：" + (d.last_error || "内容不一致"), false);
   else if (d.status === "UNCERTAIN") showMsg("未拿到回执，状态=待核：" + (d.last_error || ""), false);
   else showMsg((d.note ? d.note + "；" : "") + "当前状态：" + (STATUS_LABEL[d.status] || d.status), true);
+}
+
+function reviewCell(n) {
+  if (n.review_status !== "REVIEWED") {
+    return '<span class="badge b-NONE">未复核</span>';
+  }
+  return '<span class="badge b-REVIEWED">已复核</span>' +
+    '<div class="rv-detail">' +
+    "复核人：" + esc(n.reviewer) + "<br>" +
+    "结论：" + esc(CONC_LABEL[n.review_conclusion] || n.review_conclusion) + "<br>" +
+    "备注：" + esc(n.review_remark || "—") + "<br>" +
+    '<span class="muted">#' + (n.review_id ?? "?") + " · " + esc(n.reviewed_at || "") + "</span></div>";
 }
 
 async function load() {
@@ -113,25 +138,28 @@ async function load() {
     const tr = document.createElement("tr");
     const receipt = n.receipt_id ? "#" + n.receipt_id : "—";
     tr.innerHTML =
-      "<td>" + n.id + "</td><td>" + esc(n.env) + "</td><td>" + esc(n.release_no) + "</td>" +
-      "<td>" + esc(n.result) + "</td>" +
+      "<td>" + n.id + "</td><td>" + esc(n.env) + "</td><td>" + esc(n.release_no) +
+      "</td><td>" + esc(n.result) + "</td>" +
       '<td><span class="badge b-' + n.status + '">' + (STATUS_LABEL[n.status] || n.status) + "</span></td>" +
+      "<td>" + reviewCell(n) + "</td>" +
       "<td>" + n.attempt_count + "</td><td>" + receipt + "</td>" +
       '<td class="err-text">' + esc(n.last_error || "") + "</td>" +
       '<td class="muted">' + esc(n.updated_at || "") + "</td>" +
       '<td><button class="small" data-act="send">发送/重试</button> ' +
       '<button class="small ghost" data-act="reconcile">核对</button></td>';
     tr.querySelector('[data-act="send"]').onclick = async () => {
-      report((await api(`/api/notifications/${n.id}/send`, { method: "POST" })).data); load();
+      const r = await api(`/api/notifications/${n.id}/send`, { method: "POST" });
+      report(r.data, r.status); load();
     };
     tr.querySelector('[data-act="reconcile"]').onclick = async () => {
-      report((await api(`/api/notifications/${n.id}/reconcile`, { method: "POST" })).data); load();
+      const r = await api(`/api/notifications/${n.id}/reconcile`, { method: "POST" });
+      report(r.data, r.status); load();
     };
     tbody.appendChild(tr);
   }
 }
 
-function esc(s) { return String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
+function esc(s) { return String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
 
 document.getElementById("form").onsubmit = async (e) => {
   e.preventDefault();
@@ -147,7 +175,7 @@ document.getElementById("form").onsubmit = async (e) => {
   if (c.status >= 400) { showMsg("登记失败：" + (c.data.detail || c.status), false); return; }
   const sim = document.getElementById("sim").checked ? "?simulate=lose_response" : "";
   const s = await api(`/api/notifications/${c.data.id}/send${sim}`, { method: "POST" });
-  report(s.data);
+  report(s.data, s.status);
   load();
 };
 
